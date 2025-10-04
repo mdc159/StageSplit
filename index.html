@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Karaoke Studio - Operator</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🎤 Karaoke Studio</h1>
+      <p>Python-First Karaoke with Stem Separation & Dual-Display</p>
+    </header>
+
+    <section class="url-section">
+      <label for="youtube-url">YouTube URL:</label>
+      <input type="text" id="youtube-url" placeholder="https://www.youtube.com/watch?v=..." />
+      <button id="download-btn">Download</button>
+    </section>
+
+    <section class="progress-section">
+      <div id="progress-container" style="display: none;">
+        <div class="progress-bar">
+          <div id="progress-bar-fill" class="progress-bar-fill"></div>
+        </div>
+        <p id="progress-text">Idle</p>
+      </div>
+    </section>
+
+    <section class="video-section">
+      <h2>Video Preview</h2>
+      <video id="video-preview" controls></video>
+    </section>
+
+    <section class="controls-section">
+      <h2>Processing Controls</h2>
+      <div class="button-group">
+        <button id="separate-btn" disabled>Separate Stems (6-stem)</button>
+        <button id="merge-btn" disabled>Merge Stems</button>
+      </div>
+    </section>
+
+    <section class="mixer-section">
+      <h2>Stem Mixer</h2>
+      <div id="stem-sliders">
+        <!-- Sliders will be dynamically generated after separation -->
+      </div>
+    </section>
+
+    <section class="playback-section">
+      <h2>Playback Controls</h2>
+      <div class="button-group">
+        <button id="play-btn" disabled>Play</button>
+        <button id="pause-btn" disabled>Pause</button>
+        <button id="stop-btn" disabled>Stop</button>
+      </div>
+    </section>
+
+    <section class="projector-section">
+      <h2>Dual-Display Mode</h2>
+      <div class="button-group">
+        <button id="projector-btn" disabled>Send to Projector</button>
+        <button id="close-projector-btn" disabled>Close Projector</button>
+      </div>
+    </section>
+
+    <section class="export-section">
+      <h2>Export Mix</h2>
+      <label for="output-filename">Output Filename:</label>
+      <input type="text" id="output-filename" placeholder="my_karaoke_mix.mp4" value="karaoke_mix.mp4" />
+      <button id="export-btn" disabled>Export Mix</button>
+    </section>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>

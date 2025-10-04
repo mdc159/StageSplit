@@ -1,0 +1,62 @@
+Title: Python-First Karaoke Studio (YouTube Download + Stem Mixer + Dual-Display Video)
+
+Goal:
+Build a desktop karaoke application with a Python backend for all audio/video processing and an Electron front-end for the user interface.
+The app should:
+1. Accept a YouTube URL.
+2. Download the video using yt-dlp.
+3. Separate the audio into 4 or 6 stems using Demucs.
+4. Merge those stems into one multichannel WAV (sample-accurate).
+5. Let the operator play the video, adjust stem volume sliders, and export a remixed MP4.
+6. Support a dual-display mode where only the video is shown fullscreen on an external projector or HDMI display.
+
+Architecture:
+- Python backend (FastAPI or Flask):
+  Handles all processing:
+  * yt-dlp for downloading the video.
+  * demucs for stem separation (4- or 6-stem model).
+  * ffmpeg for merging stems into a multichannel WAV and exporting final mixes.
+  * Endpoints return JSON responses with progress and file paths.
+
+- Electron frontend (React or plain HTML/JS):
+  * Provides UI controls and video preview.
+  * Communicates with Python API using Axios (HTTP).
+  * Displays download/separation progress, playback controls, faders, and export options.
+
+User Interface Requirements
+Main Operator Window:
+- URL input field.
+- Buttons: Download, Separate, Play, Pause, Export Mix.
+- Embedded video preview (HTML <video> element).
+- Volume sliders for each stem (Vocals, Drums, Bass, Guitar, Piano, Other).
+- Real-time fader adjustments update playback audio.
+- Progress bars and status text for long tasks.
+
+Dual-Display (Projector) Mode:
+- A button labeled "Send to Projector" opens a second Electron BrowserWindow.
+- That window shows only the video (no controls).
+- It automatically goes fullscreen on the second monitor or HDMI display.
+- The video playback is synchronized with the main window (play, pause, seek).
+- If no external display is detected, show a popup and play fullscreen on the same display.
+
+Backend Endpoints (Examples):
+POST /download: Input { url } → Downloads highest-quality MP4.
+POST /separate: Input { model: "4stem" | "6stem" } → Runs Demucs.
+POST /merge: Merges stems → multichannel WAV.
+POST /mix-export: Input { gains: [...], outfile } → Applies gains and remuxes MP4.
+GET /progress: Returns task status (download, separate, export).
+
+Tech Stack:
+Python: yt-dlp, demucs, ffmpeg-python, soundfile, numpy, fastapi or flask, uvicorn.
+Electron/Node: React or vanilla JS, Web Audio API (for local playback gain control), axios, electron-builder.
+
+Output / Export:
+- FFmpeg should remux with -c:v copy (no video re-encode).
+- Output: remixed.mp4 in a user-selectable folder.
+- Include file path and completion alert.
+
+Design Priorities:
+- Prioritize audio quality over speed.
+- Keep A/V sync stable.
+- Backend = all processing; front-end = playback, sliders, and video projection.
+- Modular code (easy to extend with panning, EQ, or effects later).
