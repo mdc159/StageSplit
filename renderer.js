@@ -38,6 +38,102 @@ let sourceNodes = []; // Store source nodes for playback
 let isPlaying = false;
 let startTime = 0;
 let pauseTime = 0;
+let backendStemOrder = null;
+let backendChannelLayout = null;
+let suppressVideoSeekHandler = false;
+
+videoPreview.muted = true;
+videoPreview.volume = 0;
+
+videoPreview.addEventListener('loadedmetadata', () => {
+  videoPreview.muted = true;
+  videoPreview.volume = 0;
+});
+
+videoPreview.addEventListener('seeked', () => {
+  if (!audioContext) {
+    return;
+  }
+  if (suppressVideoSeekHandler) {
+    suppressVideoSeekHandler = false;
+    return;
+  }
+  const targetTime = videoPreview.currentTime;
+  if (isPlaying) {
+    restartPlaybackAt(targetTime);
+  } else {
+    pauseTime = targetTime;
+    ipcRenderer.send('projector-seek', targetTime);
+  }
+});
+
+function stopCurrentSources() {
+  sourceNodes.forEach(source => {
+    try {
+      source.stop(0);
+    } catch (err) {
+      console.warn('Failed to stop source', err);
+    }
+  });
+  sourceNodes = [];
+}
+
+function scheduleVideoSeek(timeInSeconds) {
+  suppressVideoSeekHandler = true;
+  videoPreview.currentTime = timeInSeconds;
+}
+
+async function startPlaybackFrom(offsetSeconds) {
+  if (!audioContext) {
+    return;
+  }
+
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+
+  stopCurrentSources();
+
+  const clampedOffset = Math.max(0, offsetSeconds);
+  stemNames.forEach(stemName => {
+    const buffer = audioBuffers[stemName];
+    const stemGainNode = gainNodes[stemName];
+    if (!buffer || !stemGainNode) {
+      return;
+    }
+
+    const source = audioContext.createBufferSource();
+    source.buffer = buffer;
+    source.channelCount = buffer.numberOfChannels;
+    source.channelCountMode = 'explicit';
+    source.channelInterpretation = 'speakers';
+    source.connect(stemGainNode);
+
+    const safeOffset = Math.min(clampedOffset, Math.max(0, buffer.duration - 0.05));
+    try {
+      source.start(0, safeOffset);
+    } catch (err) {
+      console.error(`Failed to start stem ${stemName} at offset ${safeOffset}`, err);
+    }
+    sourceNodes.push(source);
+  });
+
+  scheduleVideoSeek(clampedOffset);
+  const videoPlayPromise = videoPreview.play();
+  if (videoPlayPromise && typeof videoPlayPromise.catch === 'function') {
+    videoPlayPromise.catch(err => console.warn('Video play rejected:', err));
+  }
+  ipcRenderer.send('projector-seek', clampedOffset);
+  ipcRenderer.send('projector-play');
+
+  startTime = audioContext.currentTime - clampedOffset;
+  pauseTime = clampedOffset;
+  isPlaying = true;
+}
+
+function restartPlaybackAt(offsetSeconds) {
+  startPlaybackFrom(offsetSeconds).catch(err => console.error('Failed to restart playback', err));
+}
 
 // --- Download Workflow ---
 downloadBtn.addEventListener('click', async () => {
@@ -97,6 +193,15 @@ separateBtn.addEventListener('click', async () => {
 
       if (result && result.separated_dir) {
         separatedDir = result.separated_dir;
+        if (result.stem_order) {
+          backendStemOrder = result.stem_order;
+        }
+        if (result.channel_layout) {
+          backendChannelLayout = result.channel_layout;
+        }
+        if (result.multichannel_wav_path) {
+          multichannelWavPath = result.multichannel_wav_path;
+        }
         mergeBtn.disabled = false;
 
         // Display remuxed file info if available
@@ -138,6 +243,12 @@ mergeBtn.addEventListener('click', async () => {
 
       if (result && result.multichannel_wav_path) {
         multichannelWavPath = result.multichannel_wav_path;
+        if (result.stem_order) {
+          backendStemOrder = result.stem_order;
+        }
+        if (result.channel_layout) {
+          backendChannelLayout = result.channel_layout;
+        }
         loadStemsForPlayback();
         alert('Stems merged! You can now play and mix.');
       }
@@ -151,24 +262,32 @@ mergeBtn.addEventListener('click', async () => {
 // --- Load Stems for Web Audio API Playback ---
 async function loadStemsForPlayback() {
   try {
+    if (!separatedDir) {
+      throw new Error('Separated directory is not set.');
+    }
+
     // Clear previous state to avoid duplicate sliders
+    stopCurrentSources();
+    if (audioContext) {
+      try {
+        audioContext.close();
+      } catch (closeErr) {
+        console.warn('Failed to close previous AudioContext:', closeErr);
+      }
+    }
+
     stemNames = [];
     stemGains = {};
     audioBuffers = {};
     gainNodes = {};
-    sourceNodes.forEach(source => {
-      try { source.stop(); } catch (e) { /* ignore */ }
-    });
-    sourceNodes = [];
     isPlaying = false;
     pauseTime = 0;
 
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
-    // Fetch list of stem files from the separated directory
-    // We'll need to make a request to get the list of files
-    // For simplicity, we'll assume standard Demucs output names
-    const possibleStems = ['vocals', 'drums', 'bass', 'other', 'guitar', 'piano'];
+    const possibleStems = backendStemOrder && backendStemOrder.length > 0
+      ? backendStemOrder
+      : ['vocals', 'drums', 'bass', 'guitar', 'piano', 'other'];
 
     for (const stemName of possibleStems) {
       const stemPath = `${separatedDir}/${stemName}.wav`.replace(/^\.\//, '');
@@ -192,6 +311,10 @@ async function loadStemsForPlayback() {
     // Create master mixer node for proper stem summing
     masterMixerNode = audioContext.createGain();
     masterMixerNode.gain.value = 1.0;
+    masterMixerNode.channelCountMode = 'explicit';
+    masterMixerNode.channelInterpretation = 'speakers';
+  const destinationChannels = audioContext.destination.maxChannelCount || 2;
+  masterMixerNode.channelCount = Math.min(destinationChannels, 2);
     masterMixerNode.connect(audioContext.destination);
     console.log('Created master mixer node');
 
@@ -200,8 +323,8 @@ async function loadStemsForPlayback() {
       const gainNode = audioContext.createGain();
       gainNode.gain.value = stemGains[stemName];
 
-      // Explicit stereo channel configuration
-      gainNode.channelCount = 2;
+      const buffer = audioBuffers[stemName];
+      gainNode.channelCount = buffer ? buffer.numberOfChannels : 2;
       gainNode.channelCountMode = 'explicit';
       gainNode.channelInterpretation = 'speakers';
 
@@ -227,7 +350,11 @@ async function loadStemsForPlayback() {
     projectorBtn.disabled = false;
     exportBtn.disabled = false;
 
-    console.log(`Loaded ${stemNames.length} stems successfully`);
+    if (backendChannelLayout) {
+      console.log(`Loaded ${stemNames.length} stems with layout ${backendChannelLayout}`);
+    } else {
+      console.log(`Loaded ${stemNames.length} stems successfully`);
+    }
 
   } catch (error) {
     console.error('Failed to load stems:', error);
@@ -274,61 +401,19 @@ function generateStemSliders() {
 }
 
 // --- Playback Controls ---
-playBtn.addEventListener('click', async () => {
+playBtn.addEventListener('click', () => {
   if (!audioContext) {
     alert('Stems not loaded yet.');
     return;
   }
 
   if (isPlaying) {
-    return; // Already playing
+    return;
   }
 
-  // Resume AudioContext (required by modern browsers)
-  console.log('AudioContext state before resume:', audioContext.state);
-  if (audioContext.state === 'suspended') {
-    await audioContext.resume();
-    console.log('AudioContext resumed, new state:', audioContext.state);
-  }
-
-  // Stop any existing sources
-  sourceNodes.forEach(source => {
-    try { source.stop(); } catch (e) { /* ignore */ }
-  });
-  sourceNodes = [];
-
-  // Create new source nodes for each stem
-  const offset = pauseTime; // Resume from pause time
-  console.log('Playing stems:', stemNames);
-  console.log('Offset:', offset, 'seconds');
-
-  stemNames.forEach(stemName => {
-    const source = audioContext.createBufferSource();
-    source.buffer = audioBuffers[stemName];
-
-    // Explicit stereo configuration for buffer source
-    source.channelCount = 2;
-    source.channelCountMode = 'explicit';
-    source.channelInterpretation = 'speakers';
-
-    source.connect(gainNodes[stemName]);
-    source.start(0, offset);
-    sourceNodes.push(source);
-
-    const buffer = audioBuffers[stemName];
-    console.log(`Started ${stemName}: duration=${buffer.duration.toFixed(2)}s, channels=${buffer.numberOfChannels}, gain=${gainNodes[stemName].gain.value}`);
-  });
-
-  // Sync video playback
-  videoPreview.currentTime = offset;
-  videoPreview.play();
-
-  // Sync projector playback
-  ipcRenderer.send('projector-play');
-
-  startTime = audioContext.currentTime - offset;
-  isPlaying = true;
-  console.log('Playback started successfully');
+  startPlaybackFrom(pauseTime)
+    .then(() => console.log('Playback started successfully'))
+    .catch(err => alert(`Unable to start playback: ${err.message}`));
 });
 
 pauseBtn.addEventListener('click', () => {
@@ -336,14 +421,8 @@ pauseBtn.addEventListener('click', () => {
     return;
   }
 
-  // Stop all sources
-  sourceNodes.forEach(source => source.stop());
-  sourceNodes = [];
-
-  // Pause video
+  stopCurrentSources();
   videoPreview.pause();
-
-  // Pause projector
   ipcRenderer.send('projector-pause');
 
   pauseTime = audioContext.currentTime - startTime;
@@ -351,15 +430,9 @@ pauseBtn.addEventListener('click', () => {
 });
 
 stopBtn.addEventListener('click', () => {
-  // Stop all sources
-  sourceNodes.forEach(source => source.stop());
-  sourceNodes = [];
-
-  // Stop video
+  stopCurrentSources();
   videoPreview.pause();
-  videoPreview.currentTime = 0;
-
-  // Stop projector
+  scheduleVideoSeek(0);
   ipcRenderer.send('projector-pause');
   ipcRenderer.send('projector-seek', 0);
 
@@ -493,11 +566,14 @@ loadRemuxedBtn.addEventListener('click', async () => {
 
   // Set the video path and load it
   downloadedVideoPath = fileData.path;
-  videoPreview.src = `${API_BASE_URL}/files/${fileData.path}`;
+  const normalizedVideoPath = fileData.path.replace(/^\.\//, '');
+  videoPreview.src = `${API_BASE_URL}/files/${normalizedVideoPath}`;
 
   // Check if separated directory is available
   if (fileData.separated_dir) {
     separatedDir = fileData.separated_dir;
+    backendStemOrder = Array.isArray(fileData.stem_order) ? fileData.stem_order : backendStemOrder;
+    backendChannelLayout = fileData.channel_layout || backendChannelLayout;
 
     // Load stems for playback
     await loadStemsForPlayback();

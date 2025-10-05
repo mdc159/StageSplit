@@ -1,6 +1,12 @@
 const { app, BrowserWindow, ipcMain, screen } = require('electron');
 const path = require('path');
 
+app.commandLine.appendSwitch('disable-gpu');
+app.commandLine.appendSwitch('disable-gpu-compositing');
+app.disableHardwareAcceleration();
+
+const isDev = !app.isPackaged;
+
 let mainWindow;
 let projectorWindow = null;
 
@@ -16,7 +22,12 @@ function createMainWindow() {
   });
 
   mainWindow.loadFile('index.html');
-  mainWindow.webContents.openDevTools(); // For development
+  mainWindow.webContents.on('did-finish-load', () => {
+    console.log('Main window loaded');
+  });
+  if (isDev) {
+    mainWindow.webContents.openDevTools({ mode: 'detach' });
+  }
 
   mainWindow.on('closed', () => {
     mainWindow = null;

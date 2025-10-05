@@ -1,16 +1,30 @@
 import os
-import subprocess
 import asyncio
 import json
 import uuid
 import shutil
+from typing import List, Tuple
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import yt_dlp
 import soundfile as sf
 import numpy as np
 import ffmpeg
+
+# --- Stem + audio utilities ---
+EXPECTED_STEM_ORDER = ["vocals", "drums", "bass", "guitar", "piano", "other"]
+CHANNEL_LAYOUT_MAP = {
+    1: "mono",
+    2: "stereo",
+    3: "3.0",
+    4: "4.0",
+    5: "5.0",
+    6: "6.0",
+}
+RMS_SILENCE_THRESHOLD = 1e-6
+STEM_INDEX_FILENAME = "stem_index.json"
 
 # --- Configuration ---
 DOWNLOADS_DIR = "./downloads"
@@ -73,6 +87,123 @@ async def run_command(command: list, task_id: str, message_prefix: str):
     
     tasks[task_id]["message"] = f"{message_prefix} completed."
     return stdout.decode().strip()
+
+
+def _discover_stems(separated_dir: str) -> List[Tuple[str, str]]:
+    available = {}
+    for entry in os.listdir(separated_dir):
+        if entry.endswith('.wav') and entry != 'multichannel_stems.wav':
+            stem_name = os.path.splitext(entry)[0]
+            available[stem_name] = os.path.join(separated_dir, entry)
+
+    ordered = []
+    for stem_name in EXPECTED_STEM_ORDER:
+        if stem_name in available:
+            ordered.append((stem_name, available.pop(stem_name)))
+
+    # Append any remaining stems alphabetically to avoid missing custom names
+    for stem_name in sorted(available.keys()):
+        ordered.append((stem_name, available[stem_name]))
+
+    return ordered
+
+
+def _determine_layout(channel_count: int) -> str:
+    return CHANNEL_LAYOUT_MAP.get(channel_count, f"{channel_count}.0")
+
+
+def _compute_rms(path: str) -> float:
+    total = 0.0
+    sample_count = 0
+    with sf.SoundFile(path) as f:
+        for block in f.blocks(blocksize=65536, dtype='float32'):
+            if block.size == 0:
+                continue
+            total += float(np.sum(block ** 2))
+            sample_count += block.size
+    if sample_count == 0:
+        return 0.0
+    return float(np.sqrt(total / sample_count))
+
+
+async def ensure_multichannel_stem(task_id: str, separated_dir: str):
+    """Create (or refresh) multichannel_stems.wav with explicit channel layout and metadata."""
+    stems = _discover_stems(separated_dir)
+    if not stems:
+        raise ValueError(f"No WAV stem files found in {separated_dir}")
+
+    stem_order = [stem for stem, _ in stems]
+    layout = _determine_layout(len(stems))
+    multichannel_path = os.path.join(separated_dir, "multichannel_stems.wav")
+
+    # Verify stems are not silent to catch routing issues early
+    silent_stems = []
+    stem_infos = {}
+    for stem_name, stem_path in stems:
+        rms = _compute_rms(stem_path)
+        if rms < RMS_SILENCE_THRESHOLD:
+            silent_stems.append(stem_name)
+        stem_infos[stem_name] = sf.info(stem_path)
+    if silent_stems:
+        raise RuntimeError(f"The following stems appear silent (RMS<{RMS_SILENCE_THRESHOLD}): {', '.join(silent_stems)}")
+
+    # Build ffmpeg command to collapse stereo stems -> mono and join into multichannel stream
+    command = ['ffmpeg', '-y']
+    filter_parts = []
+    join_inputs = []
+
+    for idx, (stem_name, stem_path) in enumerate(stems):
+        command.extend(['-i', stem_path])
+        mono_label = f'm{idx}'
+        info = stem_infos[stem_name]
+        if info.channels == 1:
+            filter_parts.append(f'[{idx}:a]aresample=async=1[{mono_label}]')
+        else:
+            filter_parts.append(f'[{idx}:a]pan=mono|c0=0.5*c0+0.5*c1,aresample=async=1[{mono_label}]')
+        join_inputs.append(f'[{mono_label}]')
+
+    filter_parts.append(f"{''.join(join_inputs)}join=inputs={len(stems)}:channel_layout={layout}[aout]")
+    filter_complex = ';'.join(filter_parts)
+
+    command.extend([
+        '-filter_complex', filter_complex,
+        '-map', '[aout]',
+        '-c:a', 'pcm_s24le',
+        multichannel_path
+    ])
+
+    await run_command(command, task_id, "Building multichannel stem")
+
+    # Verify channel layout metadata exists
+    probe_output = await run_command([
+        'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+        '-show_entries', 'stream=channels,channel_layout', '-of', 'json',
+        multichannel_path
+    ], task_id, "Verifying multichannel layout")
+
+    try:
+        probe_data = json.loads(probe_output)
+        stream_info = probe_data['streams'][0]
+        channel_layout = stream_info.get('channel_layout')
+        channels = stream_info.get('channels')
+    except (KeyError, IndexError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Unable to parse ffprobe output for {multichannel_path}: {exc}")
+
+    if not channel_layout or channel_layout.lower() == 'unknown':
+        raise RuntimeError("Multichannel WAV is missing a valid channel layout")
+
+    if channels != len(stems):
+        raise RuntimeError(f"Expected {len(stems)} channels but found {channels}")
+
+    index_path = os.path.join(separated_dir, STEM_INDEX_FILENAME)
+    with open(index_path, 'w', encoding='utf-8') as index_file:
+        json.dump({
+            'order': stem_order,
+            'channel_layout': channel_layout,
+            'channel_count': channels
+        }, index_file, indent=2)
+
+    return multichannel_path, stem_order, channel_layout
 
 
 async def do_download(task_id: str, url: str):
@@ -160,54 +291,17 @@ async def do_merge_stems(task_id: str, separated_dir: str):
     """Merges separated stems into a single multichannel WAV file."""
     tasks[task_id] = {"status": "in_progress", "progress": 0.0, "message": "Merging stems..."}
     try:
-        stem_files = [os.path.join(separated_dir, f) for f in os.listdir(separated_dir) if f.endswith('.wav') and f != 'multichannel_stems.wav']
-        if not stem_files:
-            raise ValueError(f"No WAV stem files found in {separated_dir}")
-
-        # Read all stems and ensure they have the same sample rate and length
-        first_stem_info = sf.info(stem_files[0])
-        samplerate = first_stem_info.samplerate
-        num_frames = first_stem_info.frames
-
-        stems_data = []
-        for stem_file in stem_files:
-            data, sr = sf.read(stem_file, dtype='float32')
-            if sr != samplerate:
-                raise ValueError(f"Sample rate mismatch for {stem_file}")
-
-            # Handle both mono and stereo stems - convert to stereo if needed
-            if data.ndim == 1:
-                # Mono: convert to stereo by duplicating
-                data = np.stack([data, data], axis=1)
-            elif data.ndim == 2:
-                # Already stereo, ensure correct shape (frames, channels)
-                if data.shape[1] != 2:
-                    raise ValueError(f"Unexpected number of channels: {data.shape[1]}")
-
-            # Ensure all stems have same length
-            if data.shape[0] != num_frames:
-                if data.shape[0] < num_frames:
-                    # Pad shorter stems
-                    pad_amount = num_frames - data.shape[0]
-                    data = np.pad(data, ((0, pad_amount), (0, 0)), 'constant')
-                else:
-                    # Truncate longer stems
-                    data = data[:num_frames]
-
-            stems_data.append(data)
-
-        # Stack all stems: shape will be (num_frames, 2, num_stems)
-        # Each stem keeps its stereo channels
-        multichannel_audio = np.stack(stems_data, axis=2)  # Stack along third dimension
-
-        # Reshape to (num_frames, num_stems * 2) for writing as interleaved multichannel WAV
-        num_stems = len(stems_data)
-        multichannel_audio = multichannel_audio.reshape(num_frames, num_stems * 2)
-
-        output_wav_path = os.path.join(separated_dir, "multichannel_stems.wav")
-        sf.write(output_wav_path, multichannel_audio, samplerate)
-
-        tasks[task_id] = {"status": "completed", "progress": 1.0, "message": "Stems merged successfully.", "result": {"multichannel_wav_path": output_wav_path}}
+        multichannel_path, stem_order, channel_layout = await ensure_multichannel_stem(task_id, separated_dir)
+        tasks[task_id] = {
+            "status": "completed",
+            "progress": 1.0,
+            "message": "Stems merged successfully.",
+            "result": {
+                "multichannel_wav_path": multichannel_path,
+                "stem_order": stem_order,
+                "channel_layout": channel_layout
+            }
+        }
     except Exception as e:
         tasks[task_id] = {"status": "failed", "message": f"Stem merging failed: {e}"}
 
@@ -220,43 +314,35 @@ async def do_auto_remux(task_id: str, video_path: str, separated_dir: str):
         output_filename = f"{output_base_name}_remuxed.mp4"
         output_filepath = os.path.join(REMUXED_DIR, output_filename)
 
-        # Find all stem files
-        stem_files = sorted([f for f in os.listdir(separated_dir) if f.endswith('.wav') and f != 'multichannel_stems.wav'])
+        multichannel_path, stem_order, channel_layout = await ensure_multichannel_stem(task_id, separated_dir)
 
-        if not stem_files:
-            raise ValueError(f"No stem WAV files found in {separated_dir}")
+        command = [
+            'ffmpeg', '-y',
+            '-i', video_path,
+            '-i', multichannel_path,
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '384k',
+            '-movflags', 'use_metadata_tags',
+            '-metadata:s:a:0', f'title=Stem mix ({channel_layout})',
+            output_filepath
+        ]
 
-        # Create video input
-        video_input = ffmpeg.input(video_path)
-
-        # Create list of inputs: video first, then all audio stems
-        inputs = [video_input]
-        for stem_file in stem_files:
-            stem_path = os.path.join(separated_dir, stem_file)
-            inputs.append(ffmpeg.input(stem_path))
-
-        # Build ffmpeg command with proper stream mapping
-        # Map 0:v (video from first input), then 1:a, 2:a, 3:a... (audio from each stem)
-
-        # Start with video input
-        output = ffmpeg.output(
-            video_input['v'],  # Video stream from input 0
-            *[inputs[i]['a'] for i in range(1, len(inputs))],  # Audio streams from inputs 1-N
-            output_filepath,
-            vcodec='copy',  # Don't re-encode video
-            acodec='aac',   # Encode audio as AAC
-            audio_bitrate='192k',
-            **{'map': [f'{i}:a' for i in range(1, len(inputs))]}  # Explicit audio mapping
-        )
-
-        # Run ffmpeg
-        output.overwrite_output().run(capture_stdout=True, capture_stderr=True)
+        await run_command(command, task_id, "Remuxing stems into MP4")
 
         tasks[task_id] = {
             "status": "completed",
             "progress": 1.0,
             "message": "Auto-remux complete.",
-            "result": {"remuxed_path": output_filepath, "stem_count": len(stem_files)}
+            "result": {
+                "remuxed_path": output_filepath,
+                "stem_count": len(stem_order),
+                "stem_order": stem_order,
+                "channel_layout": channel_layout,
+                "multichannel_wav_path": multichannel_path
+            }
         }
 
     except ffmpeg.Error as e:
@@ -269,51 +355,65 @@ async def do_mix_export(task_id: str, video_path: str, multichannel_wav_path: st
     """Applies gains to stems and remuxes with video."""
     tasks[task_id] = {"status": "in_progress", "progress": 0.0, "message": "Starting mix export..."}
     try:
-        # Read the multichannel WAV
-        multichannel_audio, samplerate = sf.read(multichannel_wav_path, dtype='float32')
-        num_stems = multichannel_audio.shape[1]
+        separated_dir = os.path.dirname(multichannel_wav_path)
+        multichannel_wav_path, _, _ = await ensure_multichannel_stem(task_id, separated_dir)
+        index_path = os.path.join(separated_dir, STEM_INDEX_FILENAME)
 
-        # Apply gains
-        mixed_audio = np.zeros(multichannel_audio.shape[0], dtype='float32')
-        stem_names = sorted([os.path.splitext(os.path.basename(f))[0] for f in os.listdir(os.path.dirname(multichannel_wav_path)) if f.endswith('.wav') and f != 'multichannel_stems.wav'])
-        
-        # Ensure stem_names matches the order of channels in multichannel_audio
-        # This is a critical assumption based on how do_merge_stems stacks them.
-        # For robustness, you might want to store stem order explicitly.
-        
-        # For now, let's assume the order is consistent with sorted names.
-        # If Demucs output order is not alphabetical, this needs adjustment.
-        # A safer approach would be to read each stem individually, apply gain, and then sum.
-        
-        # Let's re-read individual stems for safer gain application
-        individual_stem_paths = {os.path.splitext(os.path.basename(f))[0]: os.path.join(os.path.dirname(multichannel_wav_path), f)
-                                 for f in os.listdir(os.path.dirname(multichannel_wav_path))
-                                 if f.endswith('.wav') and f != 'multichannel_stems.wav'}
+        stem_order = None
+        if os.path.exists(index_path):
+            with open(index_path, 'r', encoding='utf-8') as index_file:
+                stem_order = json.load(index_file).get('order')
 
-        # Get info from first stem to determine shape
-        first_stem_info = sf.info(list(individual_stem_paths.values())[0])
-        num_frames = first_stem_info.frames
-        num_channels = first_stem_info.channels
+        if not stem_order:
+            stem_order = [stem for stem, _ in _discover_stems(separated_dir)]
 
-        # Initialize mixed audio with correct shape (stereo or mono)
-        if num_channels == 2:
-            mixed_audio_sum = np.zeros((num_frames, 2), dtype='float32')
-        else:
-            mixed_audio_sum = np.zeros(num_frames, dtype='float32')
+        if not stem_order:
+            raise ValueError("No stems available for mix export.")
 
-        for stem_name, stem_path in individual_stem_paths.items():
-            stem_data, _ = sf.read(stem_path, dtype='float32')
-            gain = gains.get(stem_name, 1.0) # Default gain 1.0 if not specified
-            mixed_audio_sum += stem_data * gain
+        stem_infos = []
+        for stem_name in stem_order:
+            stem_path = os.path.join(separated_dir, f"{stem_name}.wav")
+            if not os.path.exists(stem_path):
+                continue
+            info = sf.info(stem_path)
+            stem_infos.append((stem_name, stem_path, info))
 
-        # Normalize mixed audio to prevent clipping
-        max_abs_val = np.max(np.abs(mixed_audio_sum))
-        if max_abs_val > 1.0:
-            mixed_audio_sum /= max_abs_val
+        if not stem_infos:
+            raise ValueError("Stem files referenced in index are missing.")
 
-        # Save the mixed audio to a temporary WAV file
+        samplerate = stem_infos[0][2].samplerate
+        channels = stem_infos[0][2].channels
+        max_frames = max(info.frames for _, _, info in stem_infos)
+
+        mixed_buffer = np.zeros((max_frames, channels), dtype='float32')
+
+        for stem_name, stem_path, info in stem_infos:
+            if info.samplerate != samplerate or info.channels != channels:
+                raise ValueError(f"Sample rate/channel mismatch for stem {stem_name}")
+
+            gain = gains.get(stem_name, 1.0)
+            if gain == 0.0:
+                continue
+
+            with sf.SoundFile(stem_path) as stem_file:
+                frame_cursor = 0
+                while True:
+                    block = stem_file.read(frames=65536, dtype='float32')
+                    if block.size == 0:
+                        break
+                    if block.ndim == 1:
+                        block = np.expand_dims(block, axis=1)
+                    block_len = block.shape[0]
+                    mixed_buffer[frame_cursor:frame_cursor + block_len] += block * gain
+                    frame_cursor += block_len
+
+        # Normalize to prevent clipping
+        peak = np.max(np.abs(mixed_buffer))
+        if peak > 1.0:
+            mixed_buffer /= peak
+
         temp_mixed_audio_path = os.path.join(MIXES_DIR, f"temp_mixed_audio_{uuid.uuid4().hex}.wav")
-        sf.write(temp_mixed_audio_path, mixed_audio_sum, samplerate)
+        sf.write(temp_mixed_audio_path, mixed_buffer, samplerate)
 
         output_filepath = os.path.join(MIXES_DIR, output_filename)
 
@@ -386,6 +486,7 @@ async def list_remuxed_files():
 
                 # Find matching separated directory
                 separated_dir = None
+                stem_metadata = None
                 if os.path.exists(SEPARATED_DIR):
                     for sep_dir in os.listdir(SEPARATED_DIR):
                         if sep_dir.startswith(base_name + '_'):
@@ -394,13 +495,19 @@ async def list_remuxed_files():
                             htdemucs_path = os.path.join(potential_path, 'htdemucs_6s')
                             if os.path.exists(htdemucs_path):
                                 separated_dir = htdemucs_path
+                                index_path = os.path.join(htdemucs_path, STEM_INDEX_FILENAME)
+                                if os.path.exists(index_path):
+                                    with open(index_path, 'r', encoding='utf-8') as index_file:
+                                        stem_metadata = json.load(index_file)
                                 break
 
                 remuxed_files.append({
                     "filename": filename,
                     "path": filepath,
                     "size_mb": round(file_size / (1024 * 1024), 2),
-                    "separated_dir": separated_dir
+                    "separated_dir": separated_dir,
+                    "stem_order": stem_metadata.get('order') if stem_metadata else None,
+                    "channel_layout": stem_metadata.get('channel_layout') if stem_metadata else None
                 })
     return {"files": remuxed_files}
 
@@ -410,14 +517,12 @@ async def serve_file(filename: str):
     # Basic security: ensure file is within allowed directories
     # First try the path as-is (it might already be relative to project root)
     if os.path.exists(filename) and os.path.isfile(filename):
-        from fastapi.responses import FileResponse
         return FileResponse(filename)
 
     # Then try prepending each base directory
     for base_dir in [DOWNLOADS_DIR, SEPARATED_DIR, MIXES_DIR]:
         file_path = os.path.join(base_dir, filename)
         if os.path.exists(file_path) and os.path.isfile(file_path):
-            from fastapi.responses import FileResponse
             return FileResponse(file_path)
     raise HTTPException(status_code=404, detail="File not found.")
 
