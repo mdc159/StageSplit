@@ -1,6 +1,6 @@
-# Varaoke Studio
+# StageSplit
 
-Varaoke Studio is a Python-first karaoke workstation that combines a FastAPI backend with an Electron front-end. It downloads music videos from YouTube, separates them into stems with Demucs, and lets you remix, export, and project a karaoke-ready performance from within a dual-display operator console.
+StageSplit is a Python-first karaoke workstation that combines a FastAPI backend with an Electron front-end. It downloads music videos from YouTube, separates them into stems with Demucs, and lets you remix, export, and project a karaoke-ready performance from within a dual-display operator console.
 
 ## ✨ Features
 
@@ -34,8 +34,8 @@ Varaoke Studio is a Python-first karaoke workstation that combines a FastAPI bac
 ### 1. Clone & enter the repo
 
 ```bash
-git clone https://github.com/mdc159/Varaoke-Manus.git
-cd Varaoke-Manus
+git clone https://github.com/mdc159/StageSplit.git
+cd StageSplit
 ```
 
 ### 2. Bootstrap the backend environment
