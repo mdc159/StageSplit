@@ -13,6 +13,15 @@ import soundfile as sf
 import numpy as np
 import ffmpeg
 
+# GPU detection for Demucs acceleration
+def get_demucs_device() -> str:
+    """Detect if CUDA is available for GPU acceleration, fallback to CPU."""
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
 # --- Stem + audio utilities ---
 EXPECTED_STEM_ORDER = ["vocals", "drums", "bass", "guitar", "piano", "other"]
 CHANNEL_LAYOUT_MAP = {
@@ -247,9 +256,14 @@ async def do_separate(task_id: str, video_path: str, model: str):
         unique_output_dir = os.path.join(SEPARATED_DIR, f"{output_base_name}_{uuid.uuid4().hex}")
         os.makedirs(unique_output_dir, exist_ok=True)
 
+        # Detect device for GPU acceleration
+        device = get_demucs_device()
+        tasks[task_id]["message"] = f"Starting separation on {device.upper()}..."
+
         command = [
             "python3", "-m", "demucs.separate",
             "-n", model,
+            "-d", device,  # Enable CUDA if available, fallback to CPU
             "-o", unique_output_dir,
             "--filename", "{stem}.{ext}", # Output stems directly in the unique_output_dir
             video_path

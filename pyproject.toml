@@ -1,0 +1,82 @@
+[project]
+name = "stagesplit"
+version = "0.1.0"
+description = "Python-first karaoke workstation that combines a FastAPI backend with an Electron front-end. Downloads music videos from YouTube, separates them into stems with Demucs, and lets you remix, export, and project karaoke-ready performances from within a dual-display operator console."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "ISC"}
+authors = [
+    {name = "mdc159"}
+]
+keywords = ["karaoke", "audio", "stem-separation", "demucs", "fastapi", "electron", "youtube"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: ISC License (ISCL)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.20.0",
+    "yt-dlp>=2023.7.6",
+    "numpy>=1.24.0",
+    "soundfile>=0.12.1",
+    "ffmpeg-python>=0.2.0",
+    "demucs>=4.0.0",
+    "torch>=2.0.0",
+    "torchaudio>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0.0",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+
+[project.urls]
+Homepage = "https://github.com/mdc159/StageSplit"
+Repository = "https://github.com/mdc159/StageSplit"
+Issues = "https://github.com/mdc159/StageSplit/issues"
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+include = [
+    "main.py",
+    "README.md",
+    "docs/",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.uv]
+dev-dependencies = []
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchaudio = { index = "pytorch-cu124" }
