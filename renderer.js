@@ -6,6 +6,8 @@ const API_BASE_URL = 'http://localhost:8000';
 // UI Elements
 const youtubeUrlInput = document.getElementById('youtube-url');
 const downloadBtn = document.getElementById('download-btn');
+const loadRemuxedBtn = document.getElementById('load-remuxed-btn');
+const remuxedFilesSelect = document.getElementById('remuxed-files');
 const separateBtn = document.getElementById('separate-btn');
 const mergeBtn = document.getElementById('merge-btn');
 const playBtn = document.getElementById('play-btn');
@@ -31,6 +33,7 @@ let stemGains = {};
 let audioContext = null;
 let audioBuffers = {}; // Store audio buffers for each stem
 let gainNodes = {}; // Store gain nodes for each stem
+let masterMixerNode = null; // Master mixer for all stems
 let sourceNodes = []; // Store source nodes for playback
 let isPlaying = false;
 let startTime = 0;
@@ -95,7 +98,14 @@ separateBtn.addEventListener('click', async () => {
       if (result && result.separated_dir) {
         separatedDir = result.separated_dir;
         mergeBtn.disabled = false;
-        alert('Stem separation complete! You can now merge stems.');
+
+        // Display remuxed file info if available
+        let alertMessage = 'Stem separation complete! You can now merge stems.';
+        if (result.remuxed_path) {
+          alertMessage = `Stem separation and auto-remux complete!\n\nRemuxed file: ${result.remuxed_path}\nStem count: ${result.stem_count}\n\nYou can now play and mix the stems.`;
+          loadStemsForPlayback();
+        }
+        alert(alertMessage);
       }
     });
   } catch (error) {
@@ -141,13 +151,24 @@ mergeBtn.addEventListener('click', async () => {
 // --- Load Stems for Web Audio API Playback ---
 async function loadStemsForPlayback() {
   try {
+    // Clear previous state to avoid duplicate sliders
+    stemNames = [];
+    stemGains = {};
+    audioBuffers = {};
+    gainNodes = {};
+    sourceNodes.forEach(source => {
+      try { source.stop(); } catch (e) { /* ignore */ }
+    });
+    sourceNodes = [];
+    isPlaying = false;
+    pauseTime = 0;
+
     audioContext = new (window.AudioContext || window.webkitAudioContext)();
 
     // Fetch list of stem files from the separated directory
     // We'll need to make a request to get the list of files
     // For simplicity, we'll assume standard Demucs output names
     const possibleStems = ['vocals', 'drums', 'bass', 'other', 'guitar', 'piano'];
-    stemNames = [];
 
     for (const stemName of possibleStems) {
       const stemPath = `${separatedDir}/${stemName}.wav`.replace(/^\.\//, '');
@@ -168,16 +189,36 @@ async function loadStemsForPlayback() {
       return;
     }
 
-    // Create gain nodes for each stem
+    // Create master mixer node for proper stem summing
+    masterMixerNode = audioContext.createGain();
+    masterMixerNode.gain.value = 1.0;
+    masterMixerNode.connect(audioContext.destination);
+    console.log('Created master mixer node');
+
+    // Create gain nodes for each stem with explicit stereo configuration
     stemNames.forEach(stemName => {
       const gainNode = audioContext.createGain();
       gainNode.gain.value = stemGains[stemName];
-      gainNode.connect(audioContext.destination);
+
+      // Explicit stereo channel configuration
+      gainNode.channelCount = 2;
+      gainNode.channelCountMode = 'explicit';
+      gainNode.channelInterpretation = 'speakers';
+
+      // Connect to master mixer instead of directly to destination
+      gainNode.connect(masterMixerNode);
       gainNodes[stemName] = gainNode;
+
+      console.log(`Created gain node for ${stemName}: channels=${gainNode.channelCount}, gain=${gainNode.gain.value}`);
     });
 
     // Generate sliders
     generateStemSliders();
+
+    // Completely disable video audio - use Web Audio API for playback
+    videoPreview.muted = true;
+    videoPreview.volume = 0;
+    console.log('Video audio disabled');
 
     // Enable playback controls
     playBtn.disabled = false;
@@ -186,7 +227,10 @@ async function loadStemsForPlayback() {
     projectorBtn.disabled = false;
     exportBtn.disabled = false;
 
+    console.log(`Loaded ${stemNames.length} stems successfully`);
+
   } catch (error) {
+    console.error('Failed to load stems:', error);
     alert(`Failed to load stems for playback: ${error.message}`);
   }
 }
@@ -230,7 +274,7 @@ function generateStemSliders() {
 }
 
 // --- Playback Controls ---
-playBtn.addEventListener('click', () => {
+playBtn.addEventListener('click', async () => {
   if (!audioContext) {
     alert('Stems not loaded yet.');
     return;
@@ -240,18 +284,39 @@ playBtn.addEventListener('click', () => {
     return; // Already playing
   }
 
+  // Resume AudioContext (required by modern browsers)
+  console.log('AudioContext state before resume:', audioContext.state);
+  if (audioContext.state === 'suspended') {
+    await audioContext.resume();
+    console.log('AudioContext resumed, new state:', audioContext.state);
+  }
+
   // Stop any existing sources
-  sourceNodes.forEach(source => source.stop());
+  sourceNodes.forEach(source => {
+    try { source.stop(); } catch (e) { /* ignore */ }
+  });
   sourceNodes = [];
 
   // Create new source nodes for each stem
   const offset = pauseTime; // Resume from pause time
+  console.log('Playing stems:', stemNames);
+  console.log('Offset:', offset, 'seconds');
+
   stemNames.forEach(stemName => {
     const source = audioContext.createBufferSource();
     source.buffer = audioBuffers[stemName];
+
+    // Explicit stereo configuration for buffer source
+    source.channelCount = 2;
+    source.channelCountMode = 'explicit';
+    source.channelInterpretation = 'speakers';
+
     source.connect(gainNodes[stemName]);
     source.start(0, offset);
     sourceNodes.push(source);
+
+    const buffer = audioBuffers[stemName];
+    console.log(`Started ${stemName}: duration=${buffer.duration.toFixed(2)}s, channels=${buffer.numberOfChannels}, gain=${gainNodes[stemName].gain.value}`);
   });
 
   // Sync video playback
@@ -263,6 +328,7 @@ playBtn.addEventListener('click', () => {
 
   startTime = audioContext.currentTime - offset;
   isPlaying = true;
+  console.log('Playback started successfully');
 });
 
 pauseBtn.addEventListener('click', () => {
@@ -385,3 +451,70 @@ async function pollTaskProgress(taskId, callback) {
     }
   }, 1000); // Poll every second
 }
+
+// --- Load Remuxed Files ---
+let remuxedFilesData = []; // Store file data including separated_dir
+
+async function loadRemuxedFilesList() {
+  try {
+    const response = await axios.get(`${API_BASE_URL}/list-remuxed`);
+    const { files } = response.data;
+
+    remuxedFilesData = files; // Store for later use
+
+    // Clear existing options except the first one
+    remuxedFilesSelect.innerHTML = '<option value="">-- Select a remuxed file --</option>';
+
+    // Populate dropdown
+    files.forEach((file, index) => {
+      const option = document.createElement('option');
+      option.value = index; // Use index to look up in remuxedFilesData
+      option.textContent = `${file.filename} (${file.size_mb} MB)`;
+      remuxedFilesSelect.appendChild(option);
+    });
+  } catch (error) {
+    console.error('Failed to load remuxed files:', error);
+  }
+}
+
+// Load remuxed file button handler
+loadRemuxedBtn.addEventListener('click', async () => {
+  const selectedIndex = remuxedFilesSelect.value;
+  if (!selectedIndex) {
+    alert('Please select a remuxed file first');
+    return;
+  }
+
+  const fileData = remuxedFilesData[selectedIndex];
+  if (!fileData) {
+    alert('File data not found');
+    return;
+  }
+
+  // Set the video path and load it
+  downloadedVideoPath = fileData.path;
+  videoPreview.src = `${API_BASE_URL}/files/${fileData.path}`;
+
+  // Check if separated directory is available
+  if (fileData.separated_dir) {
+    separatedDir = fileData.separated_dir;
+
+    // Load stems for playback
+    await loadStemsForPlayback();
+
+    // Enable playback controls
+    playBtn.disabled = false;
+    pauseBtn.disabled = false;
+    stopBtn.disabled = false;
+    projectorBtn.disabled = false;
+
+    alert(`Loaded: ${fileData.filename}\n\nStems loaded and ready for playback!`);
+  } else {
+    alert(`Loaded: ${fileData.filename}\n\nWarning: Separated stems not found. Cannot enable mixing.`);
+  }
+});
+
+// Load remuxed files list on page load
+window.addEventListener('DOMContentLoaded', () => {
+  loadRemuxedFilesList();
+});

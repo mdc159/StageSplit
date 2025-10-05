@@ -12,14 +12,16 @@ import soundfile as sf
 import numpy as np
 import ffmpeg
 
-# --- Configuration --- 
+# --- Configuration ---
 DOWNLOADS_DIR = "./downloads"
 SEPARATED_DIR = "./separated"
 MIXES_DIR = "./mixes"
+REMUXED_DIR = "./remuxed"
 
 os.makedirs(DOWNLOADS_DIR, exist_ok=True)
 os.makedirs(SEPARATED_DIR, exist_ok=True)
 os.makedirs(MIXES_DIR, exist_ok=True)
+os.makedirs(REMUXED_DIR, exist_ok=True)
 
 app = FastAPI()
 
@@ -142,7 +144,15 @@ async def do_separate(task_id: str, video_path: str, model: str):
         
         actual_separated_path = os.path.join(unique_output_dir, demucs_output_dirs[0])
 
-        tasks[task_id] = {"status": "completed", "progress": 1.0, "message": "Separation complete.", "result": {"separated_dir": actual_separated_path, "model": model}}
+        # Auto-trigger remuxing after successful separation
+        tasks[task_id] = {"status": "in_progress", "progress": 0.9, "message": "Separation complete. Starting auto-remux..."}
+
+        # Find the original video path to pass to remux
+        # video_path is the input parameter to this function
+        remux_result = await do_auto_remux(task_id, video_path, actual_separated_path)
+
+        tasks[task_id] = {"status": "completed", "progress": 1.0, "message": "Separation and remux complete.",
+                         "result": {"separated_dir": actual_separated_path, "model": model, **remux_result}}
     except Exception as e:
         tasks[task_id] = {"status": "failed", "message": f"Separation failed: {e}"}
 
@@ -200,6 +210,60 @@ async def do_merge_stems(task_id: str, separated_dir: str):
         tasks[task_id] = {"status": "completed", "progress": 1.0, "message": "Stems merged successfully.", "result": {"multichannel_wav_path": output_wav_path}}
     except Exception as e:
         tasks[task_id] = {"status": "failed", "message": f"Stem merging failed: {e}"}
+
+async def do_auto_remux(task_id: str, video_path: str, separated_dir: str):
+    """Automatically remuxes video with all separated stems as multi-track audio."""
+    tasks[task_id] = {"status": "in_progress", "progress": 0.0, "message": "Auto-remuxing video with stems..."}
+    try:
+        # Get base name for output file
+        output_base_name = os.path.splitext(os.path.basename(video_path))[0]
+        output_filename = f"{output_base_name}_remuxed.mp4"
+        output_filepath = os.path.join(REMUXED_DIR, output_filename)
+
+        # Find all stem files
+        stem_files = sorted([f for f in os.listdir(separated_dir) if f.endswith('.wav') and f != 'multichannel_stems.wav'])
+
+        if not stem_files:
+            raise ValueError(f"No stem WAV files found in {separated_dir}")
+
+        # Create video input
+        video_input = ffmpeg.input(video_path)
+
+        # Create list of inputs: video first, then all audio stems
+        inputs = [video_input]
+        for stem_file in stem_files:
+            stem_path = os.path.join(separated_dir, stem_file)
+            inputs.append(ffmpeg.input(stem_path))
+
+        # Build ffmpeg command with proper stream mapping
+        # Map 0:v (video from first input), then 1:a, 2:a, 3:a... (audio from each stem)
+
+        # Start with video input
+        output = ffmpeg.output(
+            video_input['v'],  # Video stream from input 0
+            *[inputs[i]['a'] for i in range(1, len(inputs))],  # Audio streams from inputs 1-N
+            output_filepath,
+            vcodec='copy',  # Don't re-encode video
+            acodec='aac',   # Encode audio as AAC
+            audio_bitrate='192k',
+            **{'map': [f'{i}:a' for i in range(1, len(inputs))]}  # Explicit audio mapping
+        )
+
+        # Run ffmpeg
+        output.overwrite_output().run(capture_stdout=True, capture_stderr=True)
+
+        tasks[task_id] = {
+            "status": "completed",
+            "progress": 1.0,
+            "message": "Auto-remux complete.",
+            "result": {"remuxed_path": output_filepath, "stem_count": len(stem_files)}
+        }
+
+    except ffmpeg.Error as e:
+        tasks[task_id] = {"status": "failed", "message": f"FFmpeg error during auto-remux: {e.stderr.decode().strip()}"}
+    except Exception as e:
+        tasks[task_id] = {"status": "failed", "message": f"Auto-remux failed: {e}"}
+
 
 async def do_mix_export(task_id: str, video_path: str, multichannel_wav_path: str, gains: dict, output_filename: str):
     """Applies gains to stems and remuxes with video."""
@@ -306,6 +370,39 @@ async def get_task_progress(task_id: str):
     if not task_info:
         raise HTTPException(status_code=404, detail="Task not found.")
     return ProgressResponse(task_id=task_id, **task_info)
+
+@app.get("/list-remuxed")
+async def list_remuxed_files():
+    """List all remuxed files in the remuxed directory with their separated directories."""
+    remuxed_files = []
+    if os.path.exists(REMUXED_DIR):
+        for filename in os.listdir(REMUXED_DIR):
+            if filename.endswith('.mp4'):
+                filepath = os.path.join(REMUXED_DIR, filename)
+                file_size = os.path.getsize(filepath)
+
+                # Extract base name (remove _remuxed.mp4)
+                base_name = filename.replace('_remuxed.mp4', '')
+
+                # Find matching separated directory
+                separated_dir = None
+                if os.path.exists(SEPARATED_DIR):
+                    for sep_dir in os.listdir(SEPARATED_DIR):
+                        if sep_dir.startswith(base_name + '_'):
+                            # Found matching directory, look for htdemucs_6s subdirectory
+                            potential_path = os.path.join(SEPARATED_DIR, sep_dir)
+                            htdemucs_path = os.path.join(potential_path, 'htdemucs_6s')
+                            if os.path.exists(htdemucs_path):
+                                separated_dir = htdemucs_path
+                                break
+
+                remuxed_files.append({
+                    "filename": filename,
+                    "path": filepath,
+                    "size_mb": round(file_size / (1024 * 1024), 2),
+                    "separated_dir": separated_dir
+                })
+    return {"files": remuxed_files}
 
 @app.get("/files/{filename:path}")
 async def serve_file(filename: str):
