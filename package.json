@@ -1,5 +1,5 @@
 {
-  "name": "karaoke-studio-electron",
+  "name": "stagesplit",
   "version": "1.0.0",
   "main": "main.js",
   "scripts": {
@@ -9,7 +9,7 @@
   },
   "build": {
     "appId": "com.yourcompany.karaokestudio",
-    "productName": "KaraokeStudio",
+  "productName": "StageSplit",
     "files": [
       "main.js",
       "index.html",
